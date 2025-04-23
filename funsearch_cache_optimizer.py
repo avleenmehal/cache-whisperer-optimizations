@@ -5,20 +5,21 @@ import random
 import json
 import time
 import numpy as np
-import openai
 from typing import List, Dict, Any, Tuple
-
+from groq import Groq
+import shutil
 # Configuration
-CHAMPSIM_PATH = "/path/to/champsim"  # Update this with your ChampSim path
-OPENAI_API_KEY = "your-api-key"      # Set your OpenAI API key here or use environment variables
-TRACES_PATH = "/path/to/traces"      # Path to ChampSim trace files
+CHAMPSIM_PATH = "../ChampSim"  # Update this with your ChampSim path
+GROQ_API_KEY = "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"      # Set your OpenAI API key here or use environment variables
+TRACES_PATH = "traces/astar_163B.trace.xz"      # Path to ChampSim trace files
 OUTPUT_PATH = "./cache_policies"     # Where to store generated policies
-NUM_GENERATIONS = 10                 # Number of generations to run
+NUM_GENERATIONS = 4                 # Number of generations to run
 POPULATION_SIZE = 5                  # Number of policies per generation
-EVALUATION_CYCLES = 50000000         # Simulation cycles for evaluation
+EVALUATION_CYCLES = 500000         # Simulation cycles for evaluation
 
 # Initialize OpenAI client
-openai.api_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
+# openai.api_key = GROQ_API_KEY
+client = Groq(api_key=GROQ_API_KEY)
 
 class CachePolicy:
     """Represents a cache replacement policy implementation"""
@@ -251,8 +252,8 @@ Name your class something unique, not drrip. Include detailed comments explainin
             print(f"Generating policy {i+1}/{POPULATION_SIZE}...")
             
             # Generate a policy using the LLM
-            response = openai.chat.completions.create(
-                model="gpt-4o",
+            response = client.chat.completions.create(
+                model = "llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": "You are a cache replacement policy expert specializing in C++ implementations for ChampSim."},
                     {"role": "user", "content": prompt.format(reference_code=self.reference_policy.code)}
@@ -311,49 +312,339 @@ Name your class something unique, not drrip. Include detailed comments explainin
         # Fallback to a default name
         return f"policy_{random.randint(1000, 9999)}"
     
+
+
     def compile_policy(self, policy_name: str) -> bool:
         """Compile the policy with ChampSim"""
         policy = self.all_policies[policy_name]
-        
-        # Create a temporary directory for compilation
-        temp_dir = os.path.join(OUTPUT_PATH, f"temp_{policy_name}")
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # Copy the policy file to ChampSim's replacement directory
-        policy_file = os.path.join(OUTPUT_PATH, f"{policy_name}.cc")
-        champsim_replacement_dir = os.path.join(CHAMPSIM_PATH, "replacement")
-        
+        policy.compilation_success = False
+
+        # Paths to your generated files and ChampSim dirs
+        policy_file   = os.path.join(OUTPUT_PATH, f"{policy_name}.cc")
+        header_file   = os.path.join(OUTPUT_PATH, f"{policy_name}.h")
+        repl_root     = os.path.join(CHAMPSIM_PATH, "replacement")
+
         try:
-            # Copy policy file to ChampSim
-            subprocess.run(["cp", policy_file, champsim_replacement_dir], check=True)
-            
-            # Generate the header file
+            # 1) Create a subdirectory for this policy
+            policy_dir = os.path.join(repl_root, policy.name)
+            os.makedirs(policy_dir, exist_ok=True)
+
+            # 2) Copy the .cc and .h into that subdirectory
+            shutil.copy(policy_file, os.path.join(policy_dir, f"{policy.name}.cc"))
+            # regenerate header just in case
             self.generate_header_file(policy_name)
-            
-            # Copy header file to ChampSim
-            header_file = os.path.join(OUTPUT_PATH, f"{policy_name}.h")
-            subprocess.run(["cp", header_file, champsim_replacement_dir], check=True)
-            
-            # Build ChampSim with the new policy
-            os.chdir(CHAMPSIM_PATH)
-            build_command = f"./build_champsim.sh bimodal no no no no {policy_name} 1"
-            process = subprocess.run(build_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            if process.returncode == 0:
+            shutil.copy(header_file, os.path.join(policy_dir, f"{policy.name}.h"))
+
+            # 3) Decide which build to run
+            build_script = os.path.join(CHAMPSIM_PATH, "build_champsim.sh")
+            if os.path.isfile(build_script):
+                # Sacusa fork build
+                cmd = f"{build_script} bimodal no no no no {policy.name} 1"
+                proc = subprocess.run(cmd,
+                                    shell=True,
+                                    cwd=CHAMPSIM_PATH,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            else:
+                # Official upstream:
+                #   a) Write a temporary JSON config
+                cfg = {
+                        "executable_name": policy.name,
+                        "block_size": 64,
+                        "page_size": 4096,
+                        "heartbeat_frequency": 10000000,
+                        "num_cores": 1,
+
+                        "ooo_cpu": [
+                            {
+                                "frequency": 4000,
+                                "ifetch_buffer_size":64,
+                                "decode_buffer_size":32,
+                                "dispatch_buffer_size":32,
+                                "register_file_size":128,
+                                "rob_size": 352,
+                                "lq_size": 128,
+                                "sq_size": 72,
+                                "fetch_width": 6,
+                                "decode_width": 6,
+                                "dispatch_width": 6,
+                                "execute_width": 4,
+                                "lq_width": 2,
+                                "sq_width": 2,
+                                "retire_width": 5,
+                                "mispredict_penalty": 1,
+                                "scheduler_size": 128,
+                                "decode_latency": 1,
+                                "dispatch_latency": 1,
+                                "schedule_latency": 0,
+                                "execute_latency": 0,
+                                "branch_predictor": "bimodal",
+                                "btb": "basic_btb"
+                            }
+                        ],
+
+                        "DIB": {
+                            "window_size": 16,
+                            "sets": 32,
+                            "ways": 8
+                        },
+
+                        "L1I": {
+                            "sets": 64,
+                            "ways": 8,
+                            "rq_size": 64,
+                            "wq_size": 64,
+                            "pq_size": 32,
+                            "mshr_size": 8,
+                            "latency": 4,
+                            "max_tag_check": 2,
+                            "max_fill": 2,
+                            "prefetch_as_load": False,
+                            "virtual_prefetch": True,
+                            "prefetch_activate": "LOAD,PREFETCH",
+                            "prefetcher": "no"
+                        },
+
+                        "L1D": {
+                            "sets": 64,
+                            "ways": 12,
+                            "rq_size": 64,
+                            "wq_size": 64,
+                            "pq_size": 8,
+                            "mshr_size": 16,
+                            "latency": 5,
+                            "max_tag_check": 2,
+                            "max_fill": 2,
+                            "prefetch_as_load": False,
+                            "virtual_prefetch": False,
+                            "prefetch_activate": "LOAD,PREFETCH",
+                            "prefetcher": "no"
+                        },
+
+                        "L2C": {
+                            "sets": 1024,
+                            "ways": 8,
+                            "rq_size": 32,
+                            "wq_size": 32,
+                            "pq_size": 16,
+                            "mshr_size": 32,
+                            "latency": 10,
+                            "max_tag_check": 1,
+                            "max_fill": 1,
+                            "prefetch_as_load": False,
+                            "virtual_prefetch": False,
+                            "prefetch_activate": "LOAD,PREFETCH",
+                            "prefetcher": "no"
+                        },
+
+                        "ITLB": {
+                            "sets": 16,
+                            "ways": 4,
+                            "rq_size": 16,
+                            "wq_size": 16,
+                            "pq_size": 0,
+                            "mshr_size": 8,
+                            "latency": 1,
+                            "max_tag_check": 2,
+                            "max_fill": 2,
+                            "prefetch_as_load": False
+                        },
+
+                        "DTLB": {
+                            "sets": 16,
+                            "ways": 4,
+                            "rq_size": 16,
+                            "wq_size": 16,
+                            "pq_size": 0,
+                            "mshr_size": 8,
+                            "latency": 1,
+                            "max_tag_check": 2,
+                            "max_fill": 2,
+                            "prefetch_as_load": False
+                        },
+
+                        "STLB": {
+                            "sets": 128,
+                            "ways": 12,
+                            "rq_size": 32,
+                            "wq_size": 32,
+                            "pq_size": 0,
+                            "mshr_size": 16,
+                            "latency": 8,
+                            "max_tag_check": 1,
+                            "max_fill": 1,
+                            "prefetch_as_load": False
+                        },
+
+                        "PTW": {
+                        "pscl5_set": 1,
+                        "pscl5_way": 2,
+                        "pscl4_set": 1,
+                        "pscl4_way": 4,
+                        "pscl3_set": 2,
+                        "pscl3_way": 4,
+                        "pscl2_set": 4,
+                        "pscl2_way": 8,
+                        "rq_size": 16,
+                        "mshr_size": 5,
+                        "max_read": 2,
+                        "max_write": 2
+                        },
+
+                        "LLC": {
+                            "frequency": 4000,
+                            "sets": 2048,
+                            "ways": 16,
+                            "rq_size": 32,
+                            "wq_size": 32,
+                            "pq_size": 32,
+                            "mshr_size": 64,
+                            "latency": 20,
+                            "max_tag_check": 1,
+                            "max_fill": 1,
+                            "prefetch_as_load": False,
+                            "virtual_prefetch": False,
+                            "prefetch_activate": "LOAD,PREFETCH",
+                            "prefetcher": "no",
+                            "replacement": policy.name
+                        },
+
+                        "physical_memory": {
+                            "data_rate": 3200,
+                            "channels": 1,
+                            "ranks": 1,
+                            "bankgroups": 8,
+                            "banks": 4,
+                            "bank_rows": 65536,
+                            "bank_columns": 1024,
+                            "channel_width": 8,
+                            "wq_size": 64,
+                            "rq_size": 64,
+                            "tCAS":  24,
+                            "tRCD": 24,
+                            "tRP": 24,
+                            "tRAS": 52,
+                            "refresh_period": 32,
+                            "refreshes_per_period": 8192
+                        },
+
+                        "virtual_memory": {
+                            "pte_page_size": 4096,
+                            "num_levels": 5,
+                            "minor_fault_penalty": 200,
+                            "randomization": 1
+                        }
+                        }
+
+                cfg_path = os.path.join(CHAMPSIM_PATH, f"{policy.name}_cfg.json")
+                with open(cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+
+                #   b) Run config.sh and make
+                subprocess.run(f"./config.sh {cfg_path}",
+                            shell=True,
+                            cwd=CHAMPSIM_PATH,
+                            check=True)
+                proc = subprocess.run("make -j",
+                                    shell=True,
+                                    cwd=CHAMPSIM_PATH,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+
+            # 4) Check build result
+            if proc.returncode == 0:
                 policy.compilation_success = True
-                print(f"Successfully compiled {policy_name}")
+                print(f"Successfully compiled {policy.name}")
                 return True
             else:
-                print(f"Failed to compile {policy_name}: {process.stderr.decode()}")
+                print(f"Build failed for {policy.name}:\n{proc.stderr.decode().strip()}")
                 return False
-                
+
         except Exception as e:
-            print(f"Error during compilation of {policy_name}: {str(e)}")
+            print(f"Error during compilation of {policy_name}: {e}")
             return False
+
+    
+    
+    # def compile_policy(self, policy_name: str) -> bool:
+    #     """Compile the policy with ChampSim"""
+    #     policy = self.all_policies[policy_name]
+        
+    #     # Create a temporary directory for compilation
+    #     temp_dir = os.path.join(OUTPUT_PATH, f"temp_{policy_name}")
+    #     os.makedirs(temp_dir, exist_ok=True)
+        
+    #     # Copy the policy file to ChampSim's replacement directory
+    #     policy_file = os.path.join(OUTPUT_PATH, f"{policy_name}.cc")
+    #     champsim_replacement_dir = os.path.join(CHAMPSIM_PATH, "replacement")
+        
+        
+        
+    #     try:
+    #         # Copy policy file to ChampSim
+    #         subprocess.run(["cp", policy_file, champsim_replacement_dir], check=True)
             
-        finally:
-            # Clean up temporary directory
-            subprocess.run(["rm", "-rf", temp_dir])
+    #         # Generate the header file
+    #         self.generate_header_file(policy_name)
+            
+    #         # Copy header file to ChampSim
+    #         header_file = os.path.join(OUTPUT_PATH, f"{policy_name}.h")
+    #         subprocess.run(["cp", header_file, champsim_replacement_dir], check=True)
+            
+    #         # Build ChampSim with the new policy
+    #         os.chdir(CHAMPSIM_PATH)
+            
+    #         # code added
+    #         #####################################################
+    #         if os.path.isfile("build_champsim.sh"):
+    #             # existing Sacusa‐fork build
+    #             build_cmd = f"./build_champsim.sh bimodal no no no no {policy_name} 1"
+    #             proc = subprocess.run(build_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    #         else:
+    #             # official upstream build
+    #             # 1) write a temp JSON config
+    #             cfg = {
+    #                 "BPT":  {"branch_predictor": "bimodal"},
+    #                 "L1D":  {"prefetcher": "no"},
+    #                 "L2C":  {"prefetcher": "no"},
+    #                 "LLC":  {"replacement": policy_name},
+    #                 "NUM_CORE": 1
+    #             }
+    #             cfg_path = os.path.join(CHAMPSIM_PATH, f"{policy_name}_cfg.json")
+    #             with open(cfg_path, "w") as f:
+    #                 json.dump(cfg, f, indent=2)
+    #             # 2) run config.sh + make
+    #             subprocess.run(f"./config.sh {cfg_path}", shell=True, check=True)
+    #             proc = subprocess.run("make -j", shell=True, check=False)
+    #         if proc.returncode == 0:
+    #             policy.compilation_success = True
+    #             return True
+    #         else:
+    #             print("Build failed:", proc.stderr.decode())
+    #             return False
+
+    #         #######################################################
+            
+            
+            
+    #         # build_command = f"./build_champsim.sh bimodal no no no no {policy_name} 1"
+    #         # process = subprocess.run(build_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+    #         # if process.returncode == 0:
+    #         #     policy.compilation_success = True
+    #         #     print(f"Successfully compiled {policy_name}")
+    #         #     return True
+    #         # else:
+    #         #     print(f"Failed to compile {policy_name}: {process.stderr.decode()}")
+    #         #     return False
+                
+    #     except Exception as e:
+    #         print(f"Error during compilation of {policy_name}: {str(e)}")
+    #         return False
+            
+    #     finally:
+    #         # Clean up temporary directory
+    #         subprocess.run(["rm", "-rf", temp_dir])
     
     def generate_header_file(self, policy_name: str) -> None:
         """Generate a header file for the policy based on the implementation"""
@@ -377,8 +668,8 @@ The header file should:
 Return only the header file code.
 """
         
-        response = openai.chat.completions.create(
-            model="gpt-4o",
+        response = client.chat.completions.create(
+            model = "llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a C++ expert who creates header files based on implementation code."},
                 {"role": "user", "content": prompt}
@@ -562,15 +853,26 @@ Focus on optimizing how the cache decides which blocks to evict when new data ne
 Return ONLY the implementation (.cc) file content. The header will be automatically generated.
 """
         
+
         # Generate a new policy using the LLM
-        response = openai.chat.completions.create(
-            model="gpt-4o",
+        
+        response = client.chat.completions.create(
+            model = "llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a cache replacement policy expert specializing in C++ implementations for ChampSim."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7  # Balance between innovation and reliability
         )
+        print(response.choices[0].message.content)
+        # response = openai.chat.completions.create(
+        #     model="gpt-4o",
+        #     messages=[
+        #         {"role": "system", "content": "You are a cache replacement policy expert specializing in C++ implementations for ChampSim."},
+        #         {"role": "user", "content": prompt}
+        #     ],
+        #     temperature=0.7  # Balance between innovation and reliability
+        # )
         
         # Extract the code from the response
         generated_text = response.choices[0].message.content
