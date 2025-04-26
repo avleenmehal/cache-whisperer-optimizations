@@ -1,4 +1,3 @@
-
 import os
 import subprocess
 import random
@@ -6,6 +5,8 @@ import json
 import time
 import numpy as np
 from typing import List, Dict, Any, Tuple
+import torch
+from transformers import GPTNeoForCausalGeneration, GPT2Tokenizer
 from groq import Groq
 import shutil
 # Configuration
@@ -20,6 +21,111 @@ EVALUATION_CYCLES = 500000         # Simulation cycles for evaluation
 # Initialize OpenAI client
 # openai.api_key = GROQ_API_KEY
 client = Groq(api_key=GROQ_API_KEY)
+
+# Initialize GPT-Neo model
+MODEL_NAME = "EleutherAI/gpt-neo-1.3B"  # Changed from OpenAI to GPT-Neo
+DEVICE = "cuda"  # Use "cpu" if no GPU available
+MAX_LENGTH = 2048
+TEMPERATURE = 0.8
+
+# Example successful policies for few-shot prompting
+EXAMPLE_POLICIES = [
+    {
+        "name": "hawkeye",
+        "description": "PC-based cache replacement policy",
+        "code": """
+#include "hawkeye.h"
+#include <vector>
+#include <unordered_map>
+
+class hawkeye : public replacement {
+private:
+    std::vector<unsigned> rrpv;
+    std::unordered_map<uint64_t, bool> pc_prediction;
+    
+public:
+    hawkeye(CACHE* cache) : 
+        replacement(cache),
+        rrpv(cache->NUM_SET * cache->NUM_WAY, 3) {}
+        
+    void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                uint64_t full_addr, uint64_t pc, uint64_t victim_addr,
+                                uint32_t type, uint8_t hit) override {
+        if (hit) {
+            rrpv[set * NUM_WAY + way] = 0;
+            return;
+        }
+        
+        bool prediction = predict_reuse(pc);
+        rrpv[set * NUM_WAY + way] = prediction ? 0 : 3;
+        update_predictor(pc, prediction);
+    }
+    
+    uint32_t find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                        const BLOCK* current_set, uint64_t pc,
+                        uint64_t full_addr, uint32_t type) override {
+        for (uint32_t way = 0; way < NUM_WAY; way++) {
+            if (rrpv[set * NUM_WAY + way] == 3)
+                return way;
+        }
+        
+        for (uint32_t way = 0; way < NUM_WAY; way++)
+            rrpv[set * NUM_WAY + way]++;
+            
+        return find_victim(cpu, instr_id, set, current_set, pc, full_addr, type);
+    }
+};
+        """
+    },
+    {
+        "name": "ship",
+        "description": "Signature-based Hit Predictor cache replacement",
+        "code": """
+#include "ship.h"
+#include <vector>
+#include <bitset>
+
+class ship : public replacement {
+private:
+    std::vector<unsigned> rrpv;
+    std::vector<std::bitset<16>> signatures;
+    
+public:
+    ship(CACHE* cache) : 
+        replacement(cache),
+        rrpv(cache->NUM_SET * cache->NUM_WAY, 3),
+        signatures(cache->NUM_SET * cache->NUM_WAY) {}
+        
+    void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
+                                uint64_t full_addr, uint64_t pc, uint64_t victim_addr,
+                                uint32_t type, uint8_t hit) override {
+        if (hit) {
+            rrpv[set * NUM_WAY + way] = 0;
+            update_signature(set, way, pc);
+            return;
+        }
+        
+        signatures[set * NUM_WAY + way] = calculate_signature(pc);
+        rrpv[set * NUM_WAY + way] = predict_reuse(signatures[set * NUM_WAY + way]) ? 1 : 3;
+    }
+    
+    uint32_t find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
+                        const BLOCK* current_set, uint64_t pc,
+                        uint64_t full_addr, uint32_t type) override {
+        for (uint32_t way = 0; way < NUM_WAY; way++) {
+            if (rrpv[set * NUM_WAY + way] == 3)
+                return way;
+        }
+        
+        for (uint32_t way = 0; way < NUM_WAY; way++)
+            rrpv[set * NUM_WAY + way]++;
+            
+        return find_victim(cpu, instr_id, set, current_set, pc, full_addr, type);
+    }
+};
+        """
+    }
+]
 
 class CachePolicy:
     """Represents a cache replacement policy implementation"""
@@ -59,6 +165,12 @@ class FunSearchCacheOptimizer:
         
         # Load the reference implementation
         self.reference_policy = self.load_reference_policy()
+        
+        # Initialize GPT-Neo model
+        self.tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
+        self.model = GPTNeoForCausalGeneration.from_pretrained(MODEL_NAME)
+        if DEVICE == "cuda" and torch.cuda.is_available():
+            self.model = self.model.to("cuda")
     
     def load_reference_policy(self) -> CachePolicy:
         """Load the reference DRRIP implementation"""
@@ -312,7 +424,66 @@ Name your class something unique, not drrip. Include detailed comments explainin
         # Fallback to a default name
         return f"policy_{random.randint(1000, 9999)}"
     
-
+    def generate_policy_with_gptneo(self, parents: List[str]) -> str:
+        """Generate a new policy using GPT-Neo with few-shot examples"""
+        # Create prompt with examples and parent policies
+        prompt = "Generate a new cache replacement policy for ChampSim. Here are some example successful policies:\n\n"
+        
+        # Add few-shot examples
+        for example in EXAMPLE_POLICIES:
+            prompt += f"// Example policy: {example['name']}\n"
+            prompt += f"// {example['description']}\n"
+            prompt += f"{example['code']}\n\n"
+            
+        # Add parent policies if available
+        if parents:
+            prompt += "Parent policies to improve upon:\n\n"
+            for parent in parents:
+                policy = self.all_policies[parent]
+                prompt += f"// Parent policy: {policy.name}\n"
+                prompt += f"{policy.code}\n\n"
+                
+        prompt += "Generate a new policy that combines the best features and improves upon them.\n"
+        
+        # Tokenize and generate
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
+        if DEVICE == "cuda" and torch.cuda.is_available():
+            inputs = inputs.to("cuda")
+            
+        outputs = self.model.generate(
+            **inputs,
+            max_length=MAX_LENGTH,
+            temperature=TEMPERATURE,
+            num_return_sequences=1,
+            pad_token_id=self.tokenizer.eos_token_id
+        )
+        
+        generated_code = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return self.extract_cpp_code(generated_code)
+    
+    def extract_cpp_code(self, generated_text: str) -> str:
+        """Extract C++ code from generated text, applying fixes for common issues"""
+        import re
+        
+        # Extract code between class definition and end of file or next comment block
+        match = re.search(r'class\s+\w+.*?(?:\/\/|$)', generated_text, re.DOTALL)
+        if not match:
+            return None
+            
+        code = match.group(0)
+        
+        # Fix common issues
+        # 1. Ensure proper includes
+        if "#include" not in code:
+            code = "#include <vector>\n#include <algorithm>\n" + code
+            
+        # 2. Check for missing semicolons after class definition
+        code = re.sub(r'}\s*$', '};', code)
+        
+        # 3. Fix common syntax errors
+        code = code.replace('override;', 'override')
+        
+        return code
 
     def compile_policy(self, policy_name: str) -> bool:
         """Compile the policy with ChampSim"""
@@ -563,88 +734,6 @@ Name your class something unique, not drrip. Include detailed comments explainin
         except Exception as e:
             print(f"Error during compilation of {policy_name}: {e}")
             return False
-
-    
-    
-    # def compile_policy(self, policy_name: str) -> bool:
-    #     """Compile the policy with ChampSim"""
-    #     policy = self.all_policies[policy_name]
-        
-    #     # Create a temporary directory for compilation
-    #     temp_dir = os.path.join(OUTPUT_PATH, f"temp_{policy_name}")
-    #     os.makedirs(temp_dir, exist_ok=True)
-        
-    #     # Copy the policy file to ChampSim's replacement directory
-    #     policy_file = os.path.join(OUTPUT_PATH, f"{policy_name}.cc")
-    #     champsim_replacement_dir = os.path.join(CHAMPSIM_PATH, "replacement")
-        
-        
-        
-    #     try:
-    #         # Copy policy file to ChampSim
-    #         subprocess.run(["cp", policy_file, champsim_replacement_dir], check=True)
-            
-    #         # Generate the header file
-    #         self.generate_header_file(policy_name)
-            
-    #         # Copy header file to ChampSim
-    #         header_file = os.path.join(OUTPUT_PATH, f"{policy_name}.h")
-    #         subprocess.run(["cp", header_file, champsim_replacement_dir], check=True)
-            
-    #         # Build ChampSim with the new policy
-    #         os.chdir(CHAMPSIM_PATH)
-            
-    #         # code added
-    #         #####################################################
-    #         if os.path.isfile("build_champsim.sh"):
-    #             # existing Sacusa‐fork build
-    #             build_cmd = f"./build_champsim.sh bimodal no no no no {policy_name} 1"
-    #             proc = subprocess.run(build_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    #         else:
-    #             # official upstream build
-    #             # 1) write a temp JSON config
-    #             cfg = {
-    #                 "BPT":  {"branch_predictor": "bimodal"},
-    #                 "L1D":  {"prefetcher": "no"},
-    #                 "L2C":  {"prefetcher": "no"},
-    #                 "LLC":  {"replacement": policy_name},
-    #                 "NUM_CORE": 1
-    #             }
-    #             cfg_path = os.path.join(CHAMPSIM_PATH, f"{policy_name}_cfg.json")
-    #             with open(cfg_path, "w") as f:
-    #                 json.dump(cfg, f, indent=2)
-    #             # 2) run config.sh + make
-    #             subprocess.run(f"./config.sh {cfg_path}", shell=True, check=True)
-    #             proc = subprocess.run("make -j", shell=True, check=False)
-    #         if proc.returncode == 0:
-    #             policy.compilation_success = True
-    #             return True
-    #         else:
-    #             print("Build failed:", proc.stderr.decode())
-    #             return False
-
-    #         #######################################################
-            
-            
-            
-    #         # build_command = f"./build_champsim.sh bimodal no no no no {policy_name} 1"
-    #         # process = subprocess.run(build_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-    #         # if process.returncode == 0:
-    #         #     policy.compilation_success = True
-    #         #     print(f"Successfully compiled {policy_name}")
-    #         #     return True
-    #         # else:
-    #         #     print(f"Failed to compile {policy_name}: {process.stderr.decode()}")
-    #         #     return False
-                
-    #     except Exception as e:
-    #         print(f"Error during compilation of {policy_name}: {str(e)}")
-    #         return False
-            
-    #     finally:
-    #         # Clean up temporary directory
-    #         subprocess.run(["rm", "-rf", temp_dir])
     
     def generate_header_file(self, policy_name: str) -> None:
         """Generate a header file for the policy based on the implementation"""
@@ -820,6 +909,30 @@ Return only the header file code.
     
     def generate_new_policy(self, parents: List[str], generation_num: int, policy_idx: int) -> str:
         """Generate a new policy through 'crossover' using the LLM"""
+        # Try using GPT-Neo first
+        try:
+            policy_code = self.generate_policy_with_gptneo(parents)
+            if policy_code:
+                policy_name = self.extract_policy_name(policy_code)
+                unique_name = f"{policy_name}_gen{generation_num}_{policy_idx}"
+                
+                policy = CachePolicy(
+                    code=policy_code,
+                    name=unique_name,
+                    parent_policies=parents
+                )
+                
+                self.all_policies[unique_name] = policy
+                
+                # Save the policy code to file
+                with open(os.path.join(OUTPUT_PATH, f"{unique_name}.cc"), "w") as f:
+                    f.write(policy_code)
+                    
+                return unique_name
+        except Exception as e:
+            print(f"GPT-Neo generation failed: {e}. Falling back to API-based generation.")
+        
+        # Fallback to API-based generation
         parent_policies = [self.all_policies[p] for p in parents]
         
         # Create a prompt that includes the parent policies
@@ -853,9 +966,7 @@ Focus on optimizing how the cache decides which blocks to evict when new data ne
 Return ONLY the implementation (.cc) file content. The header will be automatically generated.
 """
         
-
         # Generate a new policy using the LLM
-        
         response = client.chat.completions.create(
             model = "llama-3.3-70b-versatile",
             messages=[
@@ -865,14 +976,6 @@ Return ONLY the implementation (.cc) file content. The header will be automatica
             temperature=0.7  # Balance between innovation and reliability
         )
         print(response.choices[0].message.content)
-        # response = openai.chat.completions.create(
-        #     model="gpt-4o",
-        #     messages=[
-        #         {"role": "system", "content": "You are a cache replacement policy expert specializing in C++ implementations for ChampSim."},
-        #         {"role": "user", "content": prompt}
-        #     ],
-        #     temperature=0.7  # Balance between innovation and reliability
-        # )
         
         # Extract the code from the response
         generated_text = response.choices[0].message.content
